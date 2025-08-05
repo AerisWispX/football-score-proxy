@@ -1,11 +1,9 @@
 const express = require('express');
 const axios = require('axios');
-const cors = require('cors');
-
 const app = express();
-app.use(cors());
+const PORT = 3000;
 
-const PORT = process.env.PORT || 10000;
+app.use(express.static(__dirname));
 
 app.get('/api/livescores', async (req, res) => {
   try {
@@ -13,39 +11,17 @@ app.get('/api/livescores', async (req, res) => {
       'https://api.sofascore.com/api/v1/sport/football/events/live',
       {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-          'Accept': 'application/json',
-          'Referer': 'https://www.sofascore.com/',
-          'Origin': 'https://www.sofascore.com'
+          'User-Agent': 'Mozilla/5.0'
         }
       }
     );
-
-    if (!response.data || !Array.isArray(response.data.events)) {
-      return res.status(500).json({ error: 'Invalid response format from SofaScore.' });
-    }
-
-    // Simplified output
-    const simplified = response.data.events.map(event => ({
-      home: event.homeTeam.name,
-      away: event.awayTeam.name,
-      score: `${event.homeScore.display} - ${event.awayScore.display}`,
-      status: event.status.description,
-      timestamp: event.time?.currentPeriodStartTimestamp || null
-    }));
-
-    res.json({ matches: simplified });
-
-  } catch (error) {
-    console.error('❌ Proxy fetch failed:', error.message);
-    if (error.response) {
-      res.status(error.response.status).json({ error: error.message });
-    } else {
-      res.status(500).json({ error: 'Unknown server error occurred.' });
-    }
+    res.json(response.data);
+  } catch (err) {
+    console.error('❌ Error fetching live scores:', err.message);
+    res.status(500).json({ error: 'Failed to fetch live data' });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Football Score Proxy running on port ${PORT}`);
+  console.log(`✅ Server running at http://localhost:${PORT}`);
 });
