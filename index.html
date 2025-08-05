@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Live Football Scores</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      background: #111;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    h1 {
+      margin-bottom: 20px;
+      font-size: 28px;
+    }
+    .match {
+      background: #222;
+      padding: 15px;
+      margin-bottom: 15px;
+      border-radius: 10px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.4);
+    }
+    .match h3 {
+      margin: 0 0 10px;
+    }
+    .score {
+      font-size: 20px;
+      font-weight: bold;
+    }
+    .status {
+      font-size: 14px;
+      color: #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h1>⚽ Live Football Scores</h1>
+  <div id="matches">Loading...</div>
+
+  <script>
+    function formatMatchTime(event) {
+      const status = event?.status?.description || '';
+      const code = event?.status?.code;
+      const startTimestamp = event?.time?.currentPeriodStartTimestamp;
+
+      if (!startTimestamp || !event.status || code >= 100) {
+        return status;
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      let secondsPassed = now - startTimestamp;
+      if (secondsPassed < 0) secondsPassed = 0;
+
+      const minutesPassed = Math.floor(secondsPassed / 60);
+
+      let displayMinute = minutesPassed;
+
+      // Handle half-specific offset
+      switch (status.toLowerCase()) {
+        case '1st half':
+          displayMinute = minutesPassed <= 45 ? minutesPassed : `45+${minutesPassed - 45}`;
+          break;
+        case '2nd half':
+          displayMinute = minutesPassed <= 45 ? 45 + minutesPassed : `90+${minutesPassed - 45}`;
+          break;
+        case 'extra time':
+        case 'extra time 1st half':
+          displayMinute = minutesPassed <= 15 ? 90 + minutesPassed : `105+${minutesPassed - 15}`;
+          break;
+        case 'extra time 2nd half':
+          displayMinute = minutesPassed <= 15 ? 105 + minutesPassed : `120+${minutesPassed - 15}`;
+          break;
+        default:
+          displayMinute = minutesPassed;
+      }
+
+      return `${status} - ${displayMinute}'`;
+    }
+
+    async function fetchScores() {
+      const container = document.getElementById('matches');
+      try {
+        const res = await fetch('https://api.sofascore.com/api/v1/sport/football/events/live');
+        const data = await res.json();
+        const events = data.events;
+        container.innerHTML = '';
+
+        if (!events.length) {
+          container.innerHTML = '<p>No live matches right now.</p>';
+          return;
+        }
+
+        events.forEach(event => {
+          const home = event.homeTeam.name;
+          const away = event.awayTeam.name;
+          const homeScore = event.homeScore.display;
+          const awayScore = event.awayScore.display;
+          const time = formatMatchTime(event);
+
+          const matchHTML = `
+            <div class="match">
+              <h3>${home} vs ${away}</h3>
+              <div class="score">${homeScore} - ${awayScore}</div>
+              <div class="status">${time}</div>
+            </div>
+          `;
+          container.innerHTML += matchHTML;
+        });
+      } catch (err) {
+        console.error('Error:', err);
+        container.innerHTML = '<p>⚠️ Failed to load live scores.</p>';
+      }
+    }
+
+    fetchScores();
+    setInterval(fetchScores, 30000); // refresh every 30s
+  </script>
+</body>
+</html>
