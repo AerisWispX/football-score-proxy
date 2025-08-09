@@ -11,7 +11,6 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 
 let browser;
-const CONCURRENT_LIMIT = 2;
 const CACHE_DURATION = 60000;
 let cachedLiveData = null;
 let cachedScheduledData = null;
@@ -35,83 +34,81 @@ async function delay(ms) {
 }
 
 async function createBrowser() {
-  if (!browser) {
-    try {
-      browser = await puppeteer.launch({
-        headless: 'new',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--disable-gpu',
-          '--disable-web-security',
-          '--disable-features=VizDisplayCompositor',
-          '--disable-background-networking',
-          '--disable-background-timer-throttling',
-          '--disable-renderer-backgrounding',
-          '--disable-backgrounding-occluded-windows',
-          '--disable-client-side-phishing-detection',
-          '--disable-crash-reporter',
-          '--no-crash-upload',
-          '--disable-low-res-tiling',
-          '--disable-extensions',
-          '--disable-default-apps'
-        ],
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
-      });
-    } catch (err) {
-      console.error('Failed to launch Puppeteer:', err);
-      browser = null;
-    }
+  if (browser && browser.isConnected()) {
+    return browser;
+  }
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-web-security'
+      ],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
+    });
+    console.log('✅ Puppeteer browser launched');
+  } catch (err) {
+    console.error('❌ Failed to launch Puppeteer:', err);
+    browser = null;
   }
   return browser;
 }
 
 async function createPage() {
-  const browserInstance = await createBrowser();
-  const page = await browserInstance.newPage();
-  await page.setViewport({ width: 1366, height: 768 });
-  await page.setDefaultTimeout(30000);
-  await page.setDefaultNavigationTimeout(30000);
-  await page.setRequestInterception(true);
+  try {
+    const browserInstance = await createBrowser();
+    if (!browserInstance) throw new Error('Browser not available');
+    const page = await browserInstance.newPage();
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setDefaultTimeout(30000);
+    await page.setDefaultNavigationTimeout(30000);
+    await page.setRequestInterception(true);
 
-  page.on('request', req => {
-    const resourceType = req.resourceType();
-    const url = req.url();
-    if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-      req.abort();
-    } else if (url.includes('analytics') || url.includes('tracking') || url.includes('ads')) {
-      req.abort();
-    } else {
-      req.continue({
-        headers: {
-          ...req.headers(),
-          'accept': 'application/json, text/plain, */*',
-          'accept-language': 'en-US,en;q=0.9',
-          'referer': 'https://api.sofascore.com/',
-          'origin': 'https://api.sofascore.com',
-          'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-          'sec-ch-ua-mobile': '?0',
-          'sec-ch-ua-platform': '"Windows"',
-          'cache-control': 'no-cache',
-          'pragma': 'no-cache'
-        }
-      });
-    }
-  });
+    page.on('request', req => {
+      const resourceType = req.resourceType();
+      const url = req.url();
+      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+        req.abort();
+      } else if (url.includes('analytics') || url.includes('tracking') || url.includes('ads')) {
+        req.abort();
+      } else {
+        req.continue({
+          headers: {
+            ...req.headers(),
+            'accept': 'application/json, text/plain, */*',
+            'accept-language': 'en-US,en;q=0.9',
+            'referer': 'https://api.sofascore.com/',
+            'origin': 'https://api.sofascore.com',
+            'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'cache-control': 'no-cache',
+            'pragma': 'no-cache'
+          }
+        });
+      }
+    });
 
-  await page.setUserAgent(getRandomUserAgent());
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    if (!window.chrome) window.chrome = {};
-    if (!window.chrome.runtime) window.chrome.runtime = {};
-  });
-  return page;
+    await page.setUserAgent(getRandomUserAgent());
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      if (!window.chrome) window.chrome = {};
+      if (!window.chrome.runtime) window.chrome.runtime = {};
+    });
+    return page;
+  } catch (err) {
+    console.error('❌ createPage error:', err.message);
+    browser = null;
+    throw err;
+  }
 }
 
 async function fetchJson(page, url) {
@@ -218,11 +215,24 @@ async function fetchScheduledMatches() {
   }
 }
 
+async function safeFetch(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err.message.includes('Target closed')) {
+      console.warn('⚠ Puppeteer target closed, retrying...');
+      browser = null;
+      return await fn();
+    }
+    throw err;
+  }
+}
+
 app.get('/api/livescores', async (req, res) => {
   try {
     const now = Date.now();
     if (cachedLiveData && (now - lastLiveFetch) < CACHE_DURATION) return res.json(cachedLiveData);
-    const matches = await fetchLiveScores();
+    const matches = await safeFetch(fetchLiveScores);
     cachedLiveData = { matches, timestamp: now };
     lastLiveFetch = now;
     res.json(cachedLiveData);
@@ -235,7 +245,7 @@ app.get('/api/scheduled', async (req, res) => {
   try {
     const now = Date.now();
     if (cachedScheduledData && (now - lastScheduledFetch) < CACHE_DURATION) return res.json(cachedScheduledData);
-    const matches = await fetchScheduledMatches();
+    const matches = await safeFetch(fetchScheduledMatches);
     cachedScheduledData = { matches, timestamp: now };
     lastScheduledFetch = now;
     res.json(cachedScheduledData);
@@ -252,7 +262,13 @@ process.on('unhandledRejection', err => {
   console.error('Unhandled rejection:', err);
   browser = null;
 });
+process.on('SIGINT', async () => {
+  console.log('🛑 Shutting down...');
+  if (browser) await browser.close();
+  process.exit(0);
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running at http://0.0.0.0:${PORT}`);
 });
+  
