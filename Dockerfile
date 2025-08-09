@@ -1,5 +1,5 @@
-# Use Node.js 18 Alpine for smaller image size
-FROM node:18-alpine
+# Use Node.js 20 for better compatibility with newer Puppeteer
+FROM node:20-alpine
 
 # Install necessary dependencies for Puppeteer
 RUN apk add --no-cache \
@@ -10,40 +10,23 @@ RUN apk add --no-cache \
     harfbuzz \
     ca-certificates \
     ttf-freefont \
+    udev \
+    xvfb \
     && rm -rf /var/cache/apk/*
 
-# Tell Puppeteer to skip installing Chromium. We'll be using the installed package.
+# Tell Puppeteer to skip installing Chromium and use system Chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
+    DISPLAY=:99
 
 # Create app directory
 WORKDIR /usr/src/app
 
-# Create package.json with dependencies
-RUN cat > package.json << 'EOF'
-{
-  "name": "football-live-scores",
-  "version": "1.0.0",
-  "description": "Football live scores scraper with Puppeteer",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
-}
-EOF
+# Copy package files first (for better caching)
+COPY package*.json ./
 
-# Install app dependencies
-RUN npm install
+# Install app dependencies with verbose logging
+RUN npm install --only=production --verbose
 
 # Copy application files
 COPY server.js .
