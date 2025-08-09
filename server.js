@@ -2,110 +2,118 @@ const express = require("express");
 const cors = require("cors");
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+const fs = require("fs");
+const path = require("path");
 
 puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const CACHE_DURATION = 60 * 1000; // 60s
+const COOKIE_FILE = path.join(__dirname, "cookies.json");
 
-app.use(cors());
+let browser, page;
+let scheduledCache = { data: null, timestamp: 0 };
+let liveCache = { data: null, timestamp: 0 };
 
-let browser;
-let cache = {
-    scheduled: { data: null, timestamp: 0 },
-    live: { data: null, timestamp: 0 }
-};
-const CACHE_DURATION = 60 * 1000; // 60s cache
-
-async function launchBrowser() {
-    if (!browser) {
-        console.log("🔄 Launching Puppeteer browser...");
-        browser = await puppeteer.launch({
-            headless: true,
-            args: ["--no-sandbox", "--disable-setuid-sandbox"]
-        });
-        console.log("✅ Puppeteer launched.");
-    }
-}
-
-// Core fetch function using Puppeteer navigation
-async function sofascoreFetchJson(apiUrl) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            await launchBrowser();
-            console.log(`🌍 Puppeteer navigating to API (Attempt ${attempt}): ${apiUrl}`);
-
-            const apiPage = await browser.newPage();
-            await apiPage.setExtraHTTPHeaders({
-                "referer": "https://www.sofascore.com/",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36"
-            });
-
-            await apiPage.goto(apiUrl, { waitUntil: "networkidle0" });
-
-            const bodyText = await apiPage.evaluate(() => document.body.innerText);
-            await apiPage.close();
-
-            const jsonData = JSON.parse(bodyText);
-            console.log(`📦 JSON fetched: ${apiUrl}`);
-            return jsonData;
-
-        } catch (err) {
-            console.warn(`⚠ sofascoreFetchJson attempt ${attempt} failed for ${apiUrl}: ${err.message}`);
+// Load cookies from file
+async function loadCookies() {
+    if (fs.existsSync(COOKIE_FILE)) {
+        const cookies = JSON.parse(fs.readFileSync(COOKIE_FILE, "utf-8"));
+        if (cookies.length) {
+            await page.setCookie(...cookies);
+            console.log(`🍪 Loaded ${cookies.length} cookies from file.`);
         }
     }
-    return null;
 }
 
-// Scheduled matches endpoint
-app.get("/api/scheduled", async (req, res) => {
-    const today = new Date().toISOString().split("T")[0];
-    if (Date.now() - cache.scheduled.timestamp < CACHE_DURATION) {
-        return res.json(cache.scheduled.data);
-    }
+// Save cookies to file
+async function saveCookies() {
+    const cookies = await page.cookies();
+    fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2));
+    console.log(`💾 Saved ${cookies.length} cookies to file.`);
+}
 
-    const url = `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${today}`;
-    const data = await sofascoreFetchJson(url);
+// Puppeteer setup
+async function launchBrowser() {
+    console.log("🚀 Launching Puppeteer...");
+    browser = await puppeteer.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
 
-    if (data && data.events) {
-        cache.scheduled = { data, timestamp: Date.now() };
-        res.json(data);
-    } else {
-        res.status(500).json({ error: "No scheduled events or invalid structure" });
+    page = await browser.newPage();
+    await page.setUserAgent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36"
+    );
+
+    // Load Sofascore to pass Cloudflare
+    await page.goto("https://www.sofascore.com/football", {
+        waitUntil: "networkidle2",
+    });
+
+    await saveCookies();
+}
+
+// Fetch JSON from inside the browser
+async function sofascoreFetchJson(url) {
+    try {
+        return await page.evaluate(async (fetchUrl) => {
+            const res = await fetch(fetchUrl, {
+                headers: { "accept": "application/json" },
+            });
+            return await res.json();
+        }, url);
+    } catch (err) {
+        console.error(`⚠ Fetch failed for ${url}:`, err.message);
+        return null;
     }
+}
+
+// Get scheduled matches
+async function getScheduled(dateStr) {
+    const now = Date.now();
+    if (scheduledCache.data && now - scheduledCache.timestamp < CACHE_DURATION) {
+        return scheduledCache.data;
+    }
+    console.log(`📅 Fetching scheduled matches for ${dateStr}...`);
+    const url = `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${dateStr}`;
+    const json = await sofascoreFetchJson(url);
+    scheduledCache = { data: json, timestamp: now };
+    return json;
+}
+
+// Get live matches
+async function getLive() {
+    const now = Date.now();
+    if (liveCache.data && now - liveCache.timestamp < CACHE_DURATION) {
+        return liveCache.data;
+    }
+    console.log("📡 Fetching live matches...");
+    const url = "https://api.sofascore.com/api/v1/sport/football/events/live";
+    const json = await sofascoreFetchJson(url);
+    liveCache = { data: json, timestamp: now };
+    return json;
+}
+
+// Routes
+app.use(cors());
+
+app.get("/api/scheduled/:date", async (req, res) => {
+    const data = await getScheduled(req.params.date);
+    res.json(data || {});
 });
 
-// Live matches endpoint
 app.get("/api/live", async (req, res) => {
-    if (Date.now() - cache.live.timestamp < CACHE_DURATION) {
-        return res.json(cache.live.data);
-    }
-
-    const url = `https://api.sofascore.com/api/v1/sport/football/events/live`;
-    const data = await sofascoreFetchJson(url);
-
-    if (data && data.events) {
-        cache.live = { data, timestamp: Date.now() };
-        res.json(data);
-    } else {
-        res.status(500).json({ error: "No live events or invalid structure" });
-    }
+    const data = await getLive();
+    res.json(data || {});
 });
 
-// Goal scorers for a specific match
-app.get("/api/match/:id/incidents", async (req, res) => {
-    const matchId = req.params.id;
-    const url = `https://api.sofascore.com/api/v1/event/${matchId}/incidents`;
-    const data = await sofascoreFetchJson(url);
-
-    if (data && data.incidents) {
-        res.json(data);
-    } else {
-        res.status(500).json({ error: "No incidents found or invalid structure" });
-    }
-});
-
-app.listen(PORT, () => {
-    console.log(`✅ Server running at http://0.0.0.0:${PORT}`);
-    console.log(`📋 Cache duration: ${CACHE_DURATION / 1000}s`);
-});
+// Start server
+(async () => {
+    await launchBrowser();
+    await loadCookies();
+    app.listen(PORT, () => {
+        console.log(`✅ Server running at http://0.0.0.0:${PORT}`);
+    });
+})();
