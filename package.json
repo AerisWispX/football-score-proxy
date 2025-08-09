@@ -15,7 +15,11 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "puppeteer": "^24.15.0",
+    "puppeteer-core": "^24.15.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
