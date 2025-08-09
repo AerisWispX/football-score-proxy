@@ -1,10 +1,9 @@
 // server.js
-// Fixed persistent Puppeteer server for SofaScore APIs
+// Persistent Puppeteer + Sofascore-in-page fetching to avoid 403s
 // - single persistent browser instance
-// - avoids overlapping fetches
-// - reuses a single page for batch operations
-// - auto-restarts browser on disconnect
-// - safer request interception and backoff
+// - sofascoreFetchJson: visits sofascore frontend then runs fetch() in page context
+// - reuses pages, avoids overlapping fetches
+// - debug logs for cookies and successful API calls
 
 const express = require('express');
 const cors = require('cors');
@@ -18,9 +17,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-// === Configuration ===
+// === Config ===
 const CACHE_DURATION = 60 * 1000; // 60s
-const CONCURRENT_LIMIT = 2; // Not used for parallel pages here, kept for future use
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -45,12 +43,10 @@ const jitterDelay = (ms) => new Promise(r => setTimeout(r, ms + Math.random() * 
 
 // === Puppeteer management ===
 async function createBrowser() {
-  // if browser already ok, return it
   if (browser && browser.isConnected && browser.isConnected()) return browser;
 
-  // Prevent multiple parallel launches
+  // prevent parallel launches
   if (browserLaunching) {
-    // wait until launched (or timeout)
     const start = Date.now();
     while (browserLaunching) {
       if (Date.now() - start > 20000) break; // 20s timeout
@@ -75,14 +71,12 @@ async function createBrowser() {
         '--disable-extensions',
         '--disable-background-networking',
         '--disable-background-timer-throttling',
-        '--disable-renderer-backgrounding',
-        '--disable-dev-shm-usage'
+        '--disable-renderer-backgrounding'
       ],
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       defaultViewport: { width: 1366, height: 768 }
     });
 
-    // Watch for disconnects — mark browser null so next call recreates it
     browser.on('disconnected', () => {
       console.warn('⚠ Puppeteer browser disconnected. Marking for restart.');
       browser = null;
@@ -104,11 +98,10 @@ async function createStealthPage() {
   if (!b) throw new Error('No browser available');
 
   const page = await b.newPage();
-  // Timeouts
   page.setDefaultTimeout(30000);
   page.setDefaultNavigationTimeout(30000);
 
-  // Block heavy resources & add headers
+  // Request interception: block heavy resources and add realistic headers
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     const url = req.url();
@@ -125,12 +118,17 @@ async function createStealthPage() {
       'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
       'sec-ch-ua-mobile': '?0'
     };
-    try { req.continue({ headers: extra }); } catch (e) { req.continue(); }
+
+    try {
+      req.continue({ headers: extra });
+    } catch (e) {
+      // fallback
+      try { req.continue(); } catch (_) { req.abort(); }
+    }
   });
 
   await page.setUserAgent(randomUserAgent());
 
-  // Some stealthy navigator overrides
   await page.evaluateOnNewDocument(() => {
     try {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -138,104 +136,77 @@ async function createStealthPage() {
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
       if (!window.chrome) window.chrome = {};
       if (!window.chrome.runtime) window.chrome.runtime = {};
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) { /* ignore */ }
   });
 
   return page;
 }
 
-// Helper to safely goto JSON endpoint and parse text body as JSON
-async function pageFetchJson(page, url, opts = {}) {
-  const maxRetries = opts.retries ?? 2;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+// === Sofascore in-page fetch ===
+// visits the Sofascore frontend to get cookies/session then runs fetch(url) inside the page
+async function sofascoreFetchJson(page, apiUrl, { retries = 2, originPage = 'https://www.sofascore.com/football' } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      // small warm-up navigate to origin for cookies/session on first attempt
-      if (attempt === 0) {
-        try {
-          await page.goto('https://api.sofascore.com/', { waitUntil: 'domcontentloaded', timeout: 12000 });
-          await jitterDelay(400 + Math.random() * 800);
-        } catch (e) {
-          // ignore; not fatal
-        }
-      }
+      // Open sofascore frontend (warm-up) to get cookies/sessions/tokens
+      await page.goto(originPage, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await jitterDelay(400 + Math.random() * 800);
 
-      const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-      if (!resp) throw new Error('No response object from page.goto');
-      const status = resp.status ? resp.status() : 0;
-      if (status === 403) throw new Error('403 Forbidden');
-      if (status >= 400 && status !== 304) throw new Error(`HTTP ${status}`);
-
-      // read body (as text) and parse
-      const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '');
-      if (!bodyText) return null;
+      // debug: show relevant cookies (not printing all headers to avoid noise)
       try {
-        return JSON.parse(bodyText);
-      } catch (parseErr) {
-        // If parse fails, return null and let caller handle
-        return null;
+        const cookies = await page.cookies();
+        const sessionCookies = cookies.filter(c => /sofascore|api|session|token|_ga|_gid/i.test(c.name));
+        console.log(`🔐 Sofascore cookies (${sessionCookies.length}):`, sessionCookies.map(c => c.name).join(', ') || '(none visible)');
+      } catch (e) {
+        console.warn('⚠ Could not read cookies:', e && e.message ? e.message : e);
       }
+
+      // perform fetch inside page context so request carries cookies & real headers
+      const data = await page.evaluate(async (url) => {
+        const headers = {
+          'accept': 'application/json, text/plain, */*',
+          'x-requested-with': 'XMLHttpRequest',
+          'referer': 'https://www.sofascore.com/',
+          'origin': 'https://www.sofascore.com'
+        };
+        try {
+          const res = await fetch(url, { method: 'GET', credentials: 'include', headers });
+          if (!res.ok) {
+            // throw with status to be caught below
+            throw { status: res.status, text: await res.text().catch(() => '') };
+          }
+          return await res.json();
+        } catch (err) {
+          // Re-throw shape the caller expects
+          if (err && err.status) throw new Error('HTTP ' + err.status + ' - ' + (err.text || ''));
+          throw err;
+        }
+      }, apiUrl);
+
+      // debug success
+      console.log(`✅ sofascoreFetchJson success: ${apiUrl} (attempt ${attempt + 1})`);
+      return data;
     } catch (err) {
-      console.warn(`⚠ pageFetchJson attempt ${attempt + 1} failed for ${url}: ${err && err.message ? err.message : err}`);
-      if (attempt < maxRetries) {
-        await jitterDelay(800 + attempt * 500);
+      const msg = err && err.message ? err.message : String(err);
+      console.warn(`⚠ sofascoreFetchJson attempt ${attempt + 1} failed for ${apiUrl}: ${msg}`);
+      // If 403 or similar, try again after a backoff
+      if (attempt < retries) {
+        await jitterDelay(800 + attempt * 700);
         continue;
       }
+      // final failure: return null so caller can handle
       return null;
     }
   }
   return null;
 }
 
-// === Fetchers with concurrency & caching protections ===
-
-async function fetchScheduledMatches() {
-  // Prevent overlapping scheduled fetches
-  if (scheduledFetchInProgress) {
-    console.debug('⏳ Scheduled fetch already running — returning cached scheduled data if available.');
-    return (cachedScheduledData && cachedScheduledData.matches) ? cachedScheduledData.matches : [];
-  }
-
-  scheduledFetchInProgress = true;
-  let page;
-  try {
-    page = await createStealthPage();
-    const today = new Date().toISOString().split('T')[0];
-    const url = `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${today}`;
-    console.log('🔄 Fetching scheduled matches for', today);
-    const data = await pageFetchJson(page, url, { retries: 2 });
-    if (!data || !Array.isArray(data.events)) {
-      console.warn('⚠ No scheduled events or invalid structure');
-      return [];
-    }
-    const matches = data.events.map(ev => ({
-      id: ev.id,
-      home: ev.homeTeam?.name || '',
-      away: ev.awayTeam?.name || '',
-      homeScore: 0,
-      awayScore: 0,
-      status: ev.status?.description || 'Scheduled',
-      timestamp: ev.startTimestamp || null,
-      isScheduled: true
-    }));
-    return matches;
-  } catch (err) {
-    console.error('❌ Scheduled fetch error:', err && err.message ? err.message : err);
-    return [];
-  } finally {
-    scheduledFetchInProgress = false;
-    if (page) {
-      try { await page.close(); } catch (e) { /* ignore */ }
-    }
-  }
-}
-
+// === Incident fetching with in-page fetch ===
 async function fetchGoalIncidentsSinglePage(page, matchId) {
-  // page must be created & passed in; this avoids opening many pages
   const url = `https://api.sofascore.com/api/v1/event/${matchId}/incidents`;
-  const data = await pageFetchJson(page, url, { retries: 2 });
-  if (!data || !Array.isArray(data.incidents)) return { homeScorers: [], awayScorers: [], finalScores: null, currentTime: null, addedTime: null };
+  const data = await sofascoreFetchJson(page, url, { retries: 2 });
+  if (!data || !Array.isArray(data.incidents)) {
+    return { homeScorers: [], awayScorers: [], finalScores: null, currentTime: null, addedTime: null };
+  }
 
   const homeScorers = [];
   const awayScorers = [];
@@ -243,7 +214,6 @@ async function fetchGoalIncidentsSinglePage(page, matchId) {
   let currentTime = null;
   let addedTime = null;
 
-  // iterate incidents (newest first doesn't matter here)
   for (const incident of data.incidents) {
     if (incident.incidentType === 'goal' && incident.player?.name) {
       const scorer = { name: incident.player.name, minute: incident.time || 0 };
@@ -263,38 +233,72 @@ async function fetchGoalIncidentsSinglePage(page, matchId) {
   return { homeScorers, awayScorers, finalScores, currentTime, addedTime };
 }
 
+// reuse a single page sequentially for incidents
 async function batchFetchGoalScorers(matchIds, matchesMap) {
-  // Reuse a single page to fetch incidents sequentially (reduces resource churn)
   const results = new Map();
   let page;
   try {
     page = await createStealthPage();
-
     for (let i = 0; i < matchIds.length; i++) {
       const id = matchIds[i];
       try {
-        // small stagger
         await jitterDelay(200 + (i % 3) * 150);
-
-        const match = matchesMap.get(id) || {};
         const info = await fetchGoalIncidentsSinglePage(page, id);
-
-        // as a safety, if scores are zero and incidents contain finalScores, patch them
         results.set(id, info);
       } catch (err) {
-        console.warn(`⚠ Failed to fetch incidents for match ${id}: ${err && err.message ? err.message : err}`);
+        console.warn(`⚠ Failed to fetch incidents for match ${id}:`, err && err.message ? err.message : err);
         results.set(id, { homeScorers: [], awayScorers: [], finalScores: null, currentTime: null, addedTime: null });
-        // continue to next match
       }
     }
   } catch (err) {
     console.error('❌ batchFetchGoalScorers fatal:', err && err.message ? err.message : err);
   } finally {
-    if (page) {
-      try { await page.close(); } catch (e) { /* ignore */ }
-    }
+    if (page) try { await page.close(); } catch (e) { /* ignore */ }
   }
   return results;
+}
+
+// === Fetchers ===
+async function fetchScheduledMatches() {
+  if (scheduledFetchInProgress) {
+    console.debug('⏳ Scheduled fetch already running — returning cached scheduled data if available.');
+    return (cachedScheduledData && cachedScheduledData.matches) ? cachedScheduledData.matches : [];
+  }
+
+  scheduledFetchInProgress = true;
+  let page;
+  try {
+    page = await createStealthPage();
+    const today = new Date().toISOString().split('T')[0];
+    const url = `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${today}`;
+    console.log('🔄 Fetching scheduled matches for', today);
+
+    const data = await sofascoreFetchJson(page, url, { retries: 2 });
+    if (!data || !Array.isArray(data.events)) {
+      console.warn('⚠ No scheduled events or invalid structure');
+      return [];
+    }
+
+    const matches = data.events.map(ev => ({
+      id: ev.id,
+      home: ev.homeTeam?.name || '',
+      away: ev.awayTeam?.name || '',
+      homeScore: 0,
+      awayScore: 0,
+      status: ev.status?.description || 'Scheduled',
+      timestamp: ev.startTimestamp || null,
+      isScheduled: true
+    }));
+
+    console.log(`✅ Fetched ${matches.length} scheduled matches for ${today}`);
+    return matches;
+  } catch (err) {
+    console.error('❌ Scheduled fetch error:', err && err.message ? err.message : err);
+    return [];
+  } finally {
+    scheduledFetchInProgress = false;
+    if (page) try { await page.close(); } catch (e) { /* ignore */ }
+  }
 }
 
 async function fetchLiveMatches() {
@@ -309,7 +313,7 @@ async function fetchLiveMatches() {
     page = await createStealthPage();
     const liveUrl = 'https://api.sofascore.com/api/v1/sport/football/events/live';
     console.log('🔄 Fetching live scores...');
-    const data = await pageFetchJson(page, liveUrl, { retries: 2 });
+    const data = await sofascoreFetchJson(page, liveUrl, { retries: 2 });
 
     if (!data || !Array.isArray(data.events)) {
       console.warn('⚠ No live events or invalid response structure');
@@ -321,14 +325,13 @@ async function fetchLiveMatches() {
                         (typeof ev.homeScore === 'number' ? ev.homeScore : 0);
       const awayScore = (ev.awayScore && typeof ev.awayScore.current === 'number') ? ev.awayScore.current :
                         (typeof ev.awayScore === 'number' ? ev.awayScore : 0);
-      const status = ev.status?.description || '';
       return {
         id: ev.id,
         home: ev.homeTeam?.name || '',
         away: ev.awayTeam?.name || '',
         homeScore,
         awayScore,
-        status,
+        status: ev.status?.description || '',
         timestamp: ev.startTimestamp || null,
         homeScorers: [],
         awayScorers: [],
@@ -339,11 +342,8 @@ async function fetchLiveMatches() {
 
     const matchesMap = new Map(basicMatches.map(m => [m.id, m]));
     const matchIds = Array.from(matchesMap.keys());
-
-    // Fetch incidents for all matches (sequentially via single page)
     const incidentsMap = await batchFetchGoalScorers(matchIds, matchesMap);
 
-    // Merge incident data into matches
     for (const m of basicMatches) {
       const info = incidentsMap.get(m.id);
       if (!info) continue;
@@ -351,28 +351,24 @@ async function fetchLiveMatches() {
       m.awayScorers = info.awayScorers || [];
       m.currentTime = info.currentTime || m.currentTime;
       m.addedTime = info.addedTime || m.addedTime;
-
-      // If both scores 0 but finalScores exist, patch
       if ((m.homeScore === 0 && m.awayScore === 0) && info.finalScores) {
         m.homeScore = info.finalScores.home || m.homeScore;
         m.awayScore = info.finalScores.away || m.awayScore;
       }
     }
 
+    console.log(`✅ Fetched ${basicMatches.length} live matches`);
     return basicMatches;
   } catch (err) {
     console.error('❌ fetchLiveMatches error:', err && err.message ? err.message : err);
     return [];
   } finally {
     liveFetchInProgress = false;
-    if (page) {
-      try { await page.close(); } catch (e) { /* ignore */ }
-    }
+    if (page) try { await page.close(); } catch (e) { /* ignore */ }
   }
 }
 
-// === API endpoints with caching ===
-
+// === API endpoints (caching) ===
 app.get('/api/livescores', async (req, res) => {
   try {
     const now = Date.now();
@@ -424,18 +420,19 @@ app.get('/debug/test', async (req, res) => {
   let page;
   try {
     page = await createStealthPage();
-    const resp = await page.goto('https://api.sofascore.com/api/v1/sport/football/events/live', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const status = resp ? resp.status() : null;
-    const preview = await page.evaluate(() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 400) : '');
-    res.json({ status, preview, timestamp: Date.now() });
+    const resp = await page.goto('https://www.sofascore.com/football', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await jitterDelay(400);
+    // try the live endpoint via in-page fetch
+    const data = await sofascoreFetchJson(page, 'https://api.sofascore.com/api/v1/sport/football/events/live', { retries: 1 });
+    res.json({ ok: !!data, preview: data ? JSON.stringify(data).slice(0, 400) : null, timestamp: Date.now() });
   } catch (err) {
     res.status(500).json({ error: err && err.message ? err.message : String(err) });
   } finally {
-    if (page) try { await page.close(); } catch (e) {}
+    if (page) try { await page.close(); } catch (e) { /* ignore */ }
   }
 });
 
-// === Auto-watchdog: if browser is null, try to create it in background ===
+// Warm the browser on start
 async function ensureBrowserWarm() {
   try {
     await createBrowser();
@@ -443,7 +440,6 @@ async function ensureBrowserWarm() {
     console.warn('watchdog: createBrowser failed:', e && e.message ? e.message : e);
   }
 }
-// attempt warm launch on start
 ensureBrowserWarm();
 
 // Graceful shutdown
@@ -458,7 +454,6 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('uncaughtException', (err) => {
   console.error('uncaughtException', err && err.stack ? err.stack : err);
-  // let watchdog recreate as needed, but do not exit immediately to allow debug
   browser = null;
 });
 process.on('unhandledRejection', (reason) => {
