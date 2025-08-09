@@ -12,35 +12,62 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 
 let browser;
-const CONCURRENT_LIMIT = 2; // Reduced further for stealth
-const CACHE_DURATION = 60000; // Increased cache to 60 seconds
+const CONCURRENT_LIMIT = 1; // Reduced to 1 for maximum stealth
+const CACHE_DURATION = 120000; // Increased cache to 2 minutes
+const REQUEST_DELAY = 5000; // 5 second delay between requests
 let cachedLiveData = null;
 let cachedScheduledData = null;
 let lastLiveFetch = 0;
 let lastScheduledFetch = 0;
+let requestCount = 0;
 
-// Enhanced user agents pool
+// Rotating proxies (if you have access to proxy services)
+const PROXY_LIST = [
+  // Add your proxy servers here if available
+  // 'http://proxy1:port',
+  // 'http://proxy2:port',
+];
+
+// Enhanced user agents pool with more realistic options
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 ];
 
-// Get random user agent
+// Realistic referrer URLs
+const REFERRERS = [
+  'https://www.google.com/',
+  'https://www.bing.com/',
+  'https://duckduckgo.com/',
+  'https://www.sofascore.com/',
+  'https://www.espn.com/',
+  ''
+];
+
 function getRandomUserAgent() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-// Enhanced delay with jitter
-async function delay(ms) {
-  const jitter = Math.random() * 1000; // Add up to 1 second jitter
-  return new Promise(resolve => setTimeout(resolve, ms + jitter));
+function getRandomReferrer() {
+  return REFERRERS[Math.floor(Math.random() * REFERRERS.length)];
+}
+
+// Enhanced delay with exponential backoff
+async function delay(ms, exponential = false) {
+  const baseDelay = exponential ? ms * Math.pow(2, requestCount % 4) : ms;
+  const jitter = Math.random() * 2000; // Add up to 2 seconds jitter
+  const totalDelay = baseDelay + jitter;
+  console.log(`⏱️ Waiting ${Math.round(totalDelay)}ms...`);
+  return new Promise(resolve => setTimeout(resolve, totalDelay));
 }
 
 async function createBrowser() {
   if (!browser) {
-    browser = await puppeteer.launch({
+    const launchOptions = {
       headless: 'new',
       args: [
         '--no-sandbox',
@@ -49,7 +76,6 @@ async function createBrowser() {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
         '--disable-gpu',
         '--disable-web-security',
         '--disable-features=VizDisplayCompositor',
@@ -63,10 +89,30 @@ async function createBrowser() {
         '--no-crash-upload',
         '--disable-low-res-tiling',
         '--disable-extensions',
-        '--disable-default-apps'
+        '--disable-default-apps',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-automation',
+        '--disable-dev-tools',
+        '--no-default-browser-check',
+        '--no-pings',
+        '--disable-sync',
+        '--disable-translate',
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--disable-ipc-flooding-protection'
       ],
+      ignoreDefaultArgs: ['--enable-automation'],
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-    });
+    };
+
+    // Add proxy if available
+    if (PROXY_LIST.length > 0) {
+      const randomProxy = PROXY_LIST[Math.floor(Math.random() * PROXY_LIST.length)];
+      launchOptions.args.push(`--proxy-server=${randomProxy}`);
+      console.log(`🔀 Using proxy: ${randomProxy}`);
+    }
+
+    browser = await puppeteer.launch(launchOptions);
   }
   return browser;
 }
@@ -75,140 +121,221 @@ async function createPage() {
   const browser = await createBrowser();
   const page = await browser.newPage();
   
-  // Enhanced viewport and timeout settings
-  await page.setViewport({ width: 1366, height: 768 });
-  await page.setDefaultTimeout(30000);
-  await page.setDefaultNavigationTimeout(30000);
+  // Set viewport to common screen resolution
+  const viewports = [
+    { width: 1920, height: 1080 },
+    { width: 1366, height: 768 },
+    { width: 1440, height: 900 },
+    { width: 1536, height: 864 }
+  ];
+  const randomViewport = viewports[Math.floor(Math.random() * viewports.length)];
+  await page.setViewport(randomViewport);
   
-  // Enhanced request interception with better stealth
+  // Set timeouts
+  await page.setDefaultTimeout(45000);
+  await page.setDefaultNavigationTimeout(45000);
+  
+  // Set realistic user agent and headers
+  const userAgent = getRandomUserAgent();
+  await page.setUserAgent(userAgent);
+  
+  // Set extra headers for more realistic requests
+  await page.setExtraHTTPHeaders({
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Cache-Control': 'max-age=0'
+  });
+
+  // Enhanced request interception
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     const resourceType = req.resourceType();
     const url = req.url();
     
-    // Block unnecessary resources but allow API calls
-    if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font' || resourceType === 'media') {
+    // Block unnecessary resources
+    if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
       req.abort();
-    } else if (url.includes('analytics') || url.includes('tracking') || url.includes('ads')) {
+    } else if (url.includes('analytics') || url.includes('tracking') || url.includes('ads') || url.includes('facebook') || url.includes('twitter') || url.includes('google-analytics')) {
       req.abort();
     } else {
-      // Add realistic headers to API requests
+      // Modify headers for API requests
       const headers = {
         ...req.headers(),
-        'accept': 'application/json, text/plain, */*',
-        'accept-language': 'en-US,en;q=0.9',
-        'accept-encoding': 'gzip, deflate, br',
-        'referer': 'https://api.sofascore.com/',
-        'origin': 'https://api.sofascore.com',
+        'referer': getRandomReferrer(),
         'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'cache-control': 'no-cache',
-        'pragma': 'no-cache'
+        'sec-fetch-site': 'same-origin'
       };
       
       req.continue({ headers });
     }
   });
 
-  // Set realistic user agent
-  await page.setUserAgent(getRandomUserAgent());
-  
-  // Add extra stealth measures
+  // Enhanced stealth measures
   await page.evaluateOnNewDocument(() => {
-    // Override the `plugins` property to use a custom getter
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => [1, 2, 3, 4, 5].map(() => 'Plugin'),
+    // Remove webdriver property
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
     });
-    
-    // Override the `languages` property to use a custom getter
+
+    // Mock plugins
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5].map((x, i) => ({
+        0: {type: "application/x-google-chrome-pdf", suffixes: "pdf", description: "Portable Document Format", enabledPlugin: null},
+        description: "Portable Document Format",
+        filename: "internal-pdf-viewer",
+        length: 1,
+        name: "Chrome PDF Plugin"
+      })),
+    });
+
+    // Mock languages
     Object.defineProperty(navigator, 'languages', {
       get: () => ['en-US', 'en'],
     });
-    
-    // Override the `webdriver` property to use a custom getter
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => false,
-    });
 
-    // Mock chrome runtime
+    // Mock chrome object
     if (!window.chrome) {
       window.chrome = {};
     }
     if (!window.chrome.runtime) {
       window.chrome.runtime = {};
     }
+
+    // Override permissions
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+      parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+    );
+
+    // Mock connection
+    Object.defineProperty(navigator, 'connection', {
+      get: () => ({
+        downlink: 10,
+        effectiveType: '4g',
+        rtt: 50,
+        saveData: false
+      })
+    });
   });
 
   return page;
 }
 
-// Enhanced fetchJson with better error handling and stealth
-async function fetchJson(page, url, retries = 3) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      console.log(`🔄 Attempt ${attempt + 1} for: ${url}`);
-      
-      // Add random delay between attempts
-      if (attempt > 0) {
-        await delay(2000 * attempt); // Progressive backoff with jitter
-      }
+// Enhanced session establishment
+async function establishSession(page) {
+  const sessionUrls = [
+    'https://www.sofascore.com/',
+    'https://www.sofascore.com/football',
+    'https://www.sofascore.com/live-scores'
+  ];
 
-      // First, visit the main site to establish session
-      if (attempt === 0) {
-        try {
-          await page.goto('https://api.sofascore.com/', { 
-            waitUntil: 'domcontentloaded',
-            timeout: 15000 
-          });
-          await delay(1000 + Math.random() * 2000); // Random delay 1-3 seconds
-        } catch (e) {
-          console.log('⚠️ Could not visit main site, continuing...');
-        }
-      }
+  for (const url of sessionUrls) {
+    try {
+      console.log(`🌐 Visiting ${url} to establish session...`);
       
-      // Now make the API request
-      const response = await page.goto(url, { 
+      await page.goto(url, { 
         waitUntil: 'domcontentloaded',
-        timeout: 25000 
+        timeout: 30000 
       });
       
-      console.log(`📊 Response status: ${response.status()}`);
+      // Simulate human behavior
+      await delay(2000 + Math.random() * 3000);
+      
+      // Random mouse movements and scrolling
+      await page.evaluate(() => {
+        window.scrollBy(0, Math.random() * 500);
+      });
+      
+      await delay(1000 + Math.random() * 2000);
+      
+      // Check if we got blocked
+      const title = await page.title();
+      if (title.toLowerCase().includes('access denied') || title.toLowerCase().includes('forbidden')) {
+        console.log(`🚫 Got blocked on ${url}, trying next...`);
+        continue;
+      }
+      
+      console.log(`✅ Successfully visited ${url}`);
+      break;
+      
+    } catch (error) {
+      console.log(`⚠️ Could not visit ${url}: ${error.message}`);
+      continue;
+    }
+  }
+}
+
+// Enhanced fetchJson with better anti-detection
+async function fetchJson(page, url, retries = 3) {
+  requestCount++;
+  
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      console.log(`🔄 Attempt ${attempt + 1}/${retries + 1} for: ${url}`);
+      
+      // Progressive delay with exponential backoff
+      if (attempt > 0) {
+        await delay(REQUEST_DELAY * attempt, true);
+      } else {
+        await delay(2000);
+      }
+
+      // Establish session on first attempt or after 403 errors
+      if (attempt === 0 || attempt === Math.floor(retries / 2)) {
+        await establishSession(page);
+        await delay(3000 + Math.random() * 2000);
+      }
+      
+      // Make the API request
+      console.log(`📡 Making request to: ${url}`);
+      const response = await page.goto(url, { 
+        waitUntil: 'domcontentloaded',
+        timeout: 30000 
+      });
+      
+      const status = response.status();
+      console.log(`📊 Response status: ${status}`);
       
       // Handle different response codes
-      if (response.status() === 403) {
-        console.log('🚫 Got 403, trying with different approach...');
+      if (status === 403) {
+        console.log('🚫 Got 403, implementing enhanced retry strategy...');
         
-        // Try to get fresh session cookies
-        await page.goto('https://api.sofascore.com/football', {
-          waitUntil: 'domcontentloaded',
-          timeout: 15000
-        });
-        await delay(2000 + Math.random() * 3000); // Wait 2-5 seconds
-        
-        // Retry the API call
-        const retryResponse = await page.goto(url, {
-          waitUntil: 'domcontentloaded',
-          timeout: 25000
-        });
-        
-        if (!retryResponse.ok() && retryResponse.status() !== 304) {
-          throw new Error(`HTTP ${retryResponse.status()}`);
+        if (attempt < retries) {
+          // Try to clear cookies and establish fresh session
+          await page.deleteCookie(...(await page.cookies()));
+          await delay(5000 + Math.random() * 5000);
+          continue;
         }
-      } else if (response.status() === 304) {
-        console.log(`📋 Got cached response (304) for: ${url}`);
+      } else if (status === 429) {
+        console.log('⏰ Rate limited (429), waiting longer...');
+        await delay(10000 + Math.random() * 10000);
+        continue;
+      } else if (status === 304) {
+        console.log(`📋 Got cached response (304)`);
       } else if (!response.ok()) {
-        throw new Error(`HTTP ${response.status()}`);
+        throw new Error(`HTTP ${status}`);
       }
 
       // Extract JSON content
       const content = await page.evaluate(() => {
         try {
           const bodyText = document.body.innerText.trim();
-          if (!bodyText) return null;
+          if (!bodyText || bodyText.includes('Access Denied') || bodyText.includes('Forbidden')) {
+            return null;
+          }
           return JSON.parse(bodyText);
         } catch (e) {
           console.error('JSON parse error:', e.message);
@@ -217,41 +344,17 @@ async function fetchJson(page, url, retries = 3) {
       });
       
       if (content) {
-        console.log(`✅ Successfully fetched data for: ${url}`);
+        console.log(`✅ Successfully fetched data`);
         return content;
       } else {
-        throw new Error('No valid JSON content found');
+        throw new Error('No valid JSON content found or access denied');
       }
       
     } catch (error) {
-      console.error(`❌ Attempt ${attempt + 1} failed for: ${url}`, error.message);
+      console.error(`❌ Attempt ${attempt + 1} failed: ${error.message}`);
       
       if (attempt === retries) {
-        // On final failure, try one more time with extended delay
-        console.log(`🔄 Final attempt with extended delay for: ${url}`);
-        await delay(5000 + Math.random() * 5000); // 5-10 second delay
-        
-        try {
-          const finalResponse = await page.goto(url, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
-          });
-          
-          if (finalResponse.ok() || finalResponse.status() === 304) {
-            const content = await page.evaluate(() => {
-              try {
-                return JSON.parse(document.body.innerText);
-              } catch (e) {
-                return null;
-              }
-            });
-            
-            if (content) return content;
-          }
-        } catch (finalError) {
-          console.error(`❌ Final attempt failed: ${finalError.message}`);
-        }
-        
+        console.log(`🔄 All attempts failed for: ${url}`);
         return null;
       }
     }
@@ -259,41 +362,54 @@ async function fetchJson(page, url, retries = 3) {
   return null;
 }
 
+// Alternative API approach - try different endpoints
+async function fetchLiveScoresAlternative(page) {
+  const alternativeEndpoints = [
+    'https://api.sofascore.com/api/v1/sport/football/events/live',
+    'https://api.sofascore.com/api/v1/sport/1/events/live', // football = sport ID 1
+    'https://www.sofascore.com/api/v1/sport/football/events/live'
+  ];
+
+  for (const endpoint of alternativeEndpoints) {
+    console.log(`🔄 Trying alternative endpoint: ${endpoint}`);
+    const data = await fetchJson(page, endpoint);
+    if (data && data.events) {
+      console.log(`✅ Success with endpoint: ${endpoint}`);
+      return data;
+    }
+  }
+
+  return null;
+}
+
 // Calculate actual match time based on start timestamp and current time
 function calculateActualMatchTime(startTimestamp, status, incidentTime, addedTime) {
   const now = Date.now();
-  const startTime = startTimestamp * 1000; // Convert to milliseconds
+  const startTime = startTimestamp * 1000;
   const elapsedMs = now - startTime;
-  const elapsedMinutes = Math.floor(elapsedMs / 60000); // Convert to minutes
+  const elapsedMinutes = Math.floor(elapsedMs / 60000);
 
-  // If match hasn't started yet or is scheduled
   if (elapsedMs < 0) {
     return null;
   }
 
   const statusLower = (status || '').toLowerCase();
   
-  // For finished matches, use the incident time if available
   if (statusLower === 'finished' || statusLower === 'ended') {
     return incidentTime || 90;
   }
 
-  // For live matches, calculate based on status and elapsed time
   if (statusLower.includes('1st half') || statusLower === 'started') {
-    // First half: 0-45+ minutes
-    const actualTime = Math.min(elapsedMinutes, 50); // Cap at 50 to handle added time
+    const actualTime = Math.min(elapsedMinutes, 50);
     return actualTime;
   } else if (statusLower === 'halftime') {
     return 45;
   } else if (statusLower.includes('2nd half')) {
-    // Second half: 45-90+ minutes
-    // Assume 15 minute halftime break
-    const secondHalfTime = Math.max(0, elapsedMinutes - 60); // Subtract ~60 for first half + break
-    const actualTime = Math.min(45 + secondHalfTime, 95); // 45 + second half time, cap at 95
+    const secondHalfTime = Math.max(0, elapsedMinutes - 60);
+    const actualTime = Math.min(45 + secondHalfTime, 95);
     return actualTime;
   } else if (statusLower.includes('extra time')) {
-    // Extra time: 90+ minutes
-    const extraTime = Math.max(0, elapsedMinutes - 105); // Subtract ~105 for regular time + break
+    const extraTime = Math.max(0, elapsedMinutes - 105);
     if (statusLower.includes('1st half')) {
       return Math.min(90 + extraTime, 105);
     } else if (statusLower.includes('2nd half')) {
@@ -302,11 +418,9 @@ function calculateActualMatchTime(startTimestamp, status, incidentTime, addedTim
     return Math.min(90 + extraTime, 120);
   }
 
-  // Default: use elapsed time but cap it reasonably
   return Math.min(elapsedMinutes, 120);
 }
 
-// Updated fetchGoalScorers function to also return final scores
 async function fetchGoalScorers(page, matchId, match) {
   const url = `https://api.sofascore.com/api/v1/event/${matchId}/incidents`;
   const data = await fetchJson(page, url);
@@ -322,10 +436,8 @@ async function fetchGoalScorers(page, matchId, match) {
   let lastPeriod = null;
   let finalScores = null;
 
-  // Sort incidents by time to get the latest period info
   const sortedIncidents = data.incidents.sort((a, b) => (b.time || 0) - (a.time || 0));
 
-  // Find the final scores from FT period incident
   const ftIncident = sortedIncidents.find(incident => 
     incident.incidentType === 'period' && incident.text === 'FT'
   );
@@ -335,23 +447,18 @@ async function fetchGoalScorers(page, matchId, match) {
       home: ftIncident.homeScore || 0,
       away: ftIncident.awayScore || 0
     };
-    console.log(`📊 Found final scores from FT incident for match ${matchId}: ${finalScores.home}-${finalScores.away}`);
+    console.log(`📊 Found final scores for match ${matchId}: ${finalScores.home}-${finalScores.away}`);
   }
 
   for (const incident of sortedIncidents) {
-    // Get current match time from the latest period incident
     if (incident.incidentType === 'period' && !lastPeriod) {
       lastPeriod = incident;
       
-      // For finished matches, use the final time from FT period
       if (incident.text === 'FT') {
         currentTime = incident.time || 90;
         addedTime = incident.addedTime && incident.addedTime !== 999 ? incident.addedTime : null;
-      } 
-      // For live matches, calculate actual time if addedTime is 999 (unknown)
-      else if (incident.isLive) {
+      } else if (incident.isLive) {
         if (incident.addedTime === 999 || !incident.time) {
-          // Calculate actual time based on match start and current time
           currentTime = calculateActualMatchTime(
             match.timestamp, 
             match.status, 
@@ -366,7 +473,6 @@ async function fetchGoalScorers(page, matchId, match) {
       }
     }
     
-    // Get goal scorers
     if (incident.incidentType === 'goal' && incident.player?.name) {
       const scorer = {
         name: incident.player.name,
@@ -381,61 +487,45 @@ async function fetchGoalScorers(page, matchId, match) {
     }
   }
 
-  // If no period incidents found but match is live, calculate time from timestamp
   if (!currentTime && match && match.timestamp) {
     currentTime = calculateActualMatchTime(match.timestamp, match.status, null, null);
     if (currentTime !== null) {
-      console.log(`📊 Match ${matchId}: No period data, calculated time from timestamp: ${currentTime}'`);
+      console.log(`📊 Match ${matchId}: Calculated time from timestamp: ${currentTime}'`);
     }
   }
 
   return { homeScorers, awayScorers, currentTime, addedTime, finalScores };
 }
 
-// Batch process goal scorers with limited concurrency and enhanced delays
 async function batchFetchGoalScorers(matchIds, matchesMap) {
   const results = new Map();
-  const chunks = [];
   
-  // Split into even smaller chunks for better stealth
-  for (let i = 0; i < matchIds.length; i += CONCURRENT_LIMIT) {
-    chunks.push(matchIds.slice(i, i + CONCURRENT_LIMIT));
-  }
-
-  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-    const chunk = chunks[chunkIndex];
+  // Process one by one for maximum stealth
+  for (let i = 0; i < matchIds.length; i++) {
+    const matchId = matchIds[i];
+    console.log(`🔄 Processing match ${i + 1}/${matchIds.length}: ${matchId}`);
     
-    console.log(`🔄 Processing chunk ${chunkIndex + 1}/${chunks.length} (${chunk.length} matches)`);
-    
-    const promises = chunk.map(async (matchId, index) => {
-      // Longer stagger between requests
-      await delay(index * 1000 + Math.random() * 2000);
+    const page = await createPage();
+    try {
+      const match = matchesMap.get(matchId);
+      const scorers = await fetchGoalScorers(page, matchId, match);
+      results.set(matchId, scorers);
       
-      const page = await createPage();
-      try {
-        const match = matchesMap.get(matchId);
-        const scorers = await fetchGoalScorers(page, matchId, match);
-        results.set(matchId, scorers);
-      } catch (error) {
-        console.error(`Failed to fetch scorers for match ${matchId}:`, error.message);
-        results.set(matchId, { homeScorers: [], awayScorers: [], currentTime: null, addedTime: null, finalScores: null });
-      } finally {
-        await page.close();
+      // Longer delay between requests
+      if (i < matchIds.length - 1) {
+        await delay(REQUEST_DELAY + Math.random() * 3000);
       }
-    });
-
-    await Promise.all(promises);
-    
-    // Longer delay between chunks
-    if (chunkIndex < chunks.length - 1) {
-      await delay(3000 + Math.random() * 2000); // 3-5 seconds between chunks
+    } catch (error) {
+      console.error(`Failed to fetch scorers for match ${matchId}:`, error.message);
+      results.set(matchId, { homeScorers: [], awayScorers: [], currentTime: null, addedTime: null, finalScores: null });
+    } finally {
+      await page.close();
     }
   }
 
   return results;
 }
 
-// Enhanced fetchLiveScores function
 async function fetchLiveScores() {
   console.log('🔄 Fetching live scores...');
   const startTime = Date.now();
@@ -443,9 +533,8 @@ async function fetchLiveScores() {
   const page = await createPage();
   
   try {
-    // Fetch main live scores data
-    const liveUrl = 'https://api.sofascore.com/api/v1/sport/football/events/live';
-    const data = await fetchJson(page, liveUrl);
+    // Try alternative endpoints
+    const data = await fetchLiveScoresAlternative(page);
     
     if (!data || !data.events || !Array.isArray(data.events)) {
       console.log('❌ No live events found or invalid response structure');
@@ -454,17 +543,13 @@ async function fetchLiveScores() {
 
     console.log(`📊 Found ${data.events.length} live events`);
 
-    // Process basic match info first
     const basicMatches = data.events.map(event => {
-      // Determine if match is actually live or finished
       const status = event.status?.description || 'Unknown';
       const isActuallyLive = status.toLowerCase() !== 'finished' && status.toLowerCase() !== 'ended';
       
-      // Parse scores properly - check multiple possible score formats
       let homeScore = 0;
       let awayScore = 0;
       
-      // Method 1: Check homeScore.current and awayScore.current
       if (event.homeScore && typeof event.homeScore.current === 'number') {
         homeScore = event.homeScore.current;
       } else if (event.homeScore && typeof event.homeScore === 'number') {
@@ -493,18 +578,16 @@ async function fetchLiveScores() {
       };
     });
 
-    // Create a map for quick lookup
     const matchesMap = new Map();
     basicMatches.forEach(match => matchesMap.set(match.id, match));
 
-    // Fetch goal scorers and match time for all matches (both live and recently finished)
-    const matchIds = basicMatches.map(match => match.id);
+    // Limit detailed fetching to reduce requests
+    const matchIds = basicMatches.slice(0, 10).map(match => match.id); // Only process first 10 matches
     console.log(`🥅 Fetching detailed info for ${matchIds.length} matches...`);
 
     if (matchIds.length > 0) {
       const scorersMap = await batchFetchGoalScorers(matchIds, matchesMap);
 
-      // Update matches with scorer data and match time
       for (const match of basicMatches) {
         if (scorersMap.has(match.id)) {
           const matchData = scorersMap.get(match.id);
@@ -513,7 +596,6 @@ async function fetchLiveScores() {
           match.currentTime = matchData.currentTime;
           match.addedTime = matchData.addedTime;
           
-          // Double-check scores from incidents if they seem wrong
           if ((match.homeScore === 0 && match.awayScore === 0) && matchData.finalScores) {
             match.homeScore = matchData.finalScores.home || match.homeScore;
             match.awayScore = matchData.finalScores.away || match.awayScore;
@@ -542,11 +624,24 @@ async function fetchScheduledMatches() {
   const page = await createPage();
   
   try {
-    // Get today's date in YYYY-MM-DD format
     const today = new Date().toISOString().split('T')[0];
-    const scheduledUrl = `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${today}`;
     
-    const data = await fetchJson(page, scheduledUrl);
+    // Try alternative endpoints for scheduled matches
+    const scheduledEndpoints = [
+      `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${today}`,
+      `https://api.sofascore.com/api/v1/sport/1/scheduled-events/${today}`,
+      `https://www.sofascore.com/api/v1/sport/football/scheduled-events/${today}`
+    ];
+
+    let data = null;
+    for (const endpoint of scheduledEndpoints) {
+      console.log(`🔄 Trying scheduled endpoint: ${endpoint}`);
+      data = await fetchJson(page, endpoint);
+      if (data && data.events) {
+        console.log(`✅ Success with scheduled endpoint: ${endpoint}`);
+        break;
+      }
+    }
     
     if (!data || !data.events || !Array.isArray(data.events)) {
       console.log('❌ No scheduled events found or invalid response structure');
@@ -555,7 +650,6 @@ async function fetchScheduledMatches() {
 
     console.log(`📊 Found ${data.events.length} scheduled events`);
 
-    // Process scheduled match info
     const scheduledMatches = data.events.map(event => ({
       id: event.id,
       home: event.homeTeam?.name || 'Unknown',
@@ -581,11 +675,11 @@ async function fetchScheduledMatches() {
   }
 }
 
+// API endpoints remain the same
 app.get('/api/livescores', async (req, res) => {
   try {
     const now = Date.now();
     
-    // Return cached data if still valid
     if (cachedLiveData && (now - lastLiveFetch) < CACHE_DURATION) {
       console.log('📋 Returning cached live data');
       return res.json(cachedLiveData);
@@ -593,7 +687,6 @@ app.get('/api/livescores', async (req, res) => {
 
     const matches = await fetchLiveScores();
     
-    // Update cache
     cachedLiveData = { 
       type: 'live', 
       matches,
@@ -606,7 +699,6 @@ app.get('/api/livescores', async (req, res) => {
   } catch (error) {
     console.error('❌ Live API error:', error);
     
-    // Return cached data if available, even if stale
     if (cachedLiveData) {
       console.log('📋 Returning stale cached live data due to error');
       return res.json({
@@ -626,7 +718,6 @@ app.get('/api/scheduled', async (req, res) => {
   try {
     const now = Date.now();
     
-    // Return cached data if still valid
     if (cachedScheduledData && (now - lastScheduledFetch) < CACHE_DURATION) {
       console.log('📋 Returning cached scheduled data');
       return res.json(cachedScheduledData);
@@ -634,7 +725,6 @@ app.get('/api/scheduled', async (req, res) => {
 
     const matches = await fetchScheduledMatches();
     
-    // Update cache
     cachedScheduledData = { 
       type: 'scheduled', 
       matches,
@@ -647,7 +737,6 @@ app.get('/api/scheduled', async (req, res) => {
   } catch (error) {
     console.error('❌ Scheduled API error:', error);
     
-    // Return cached data if available, even if stale
     if (cachedScheduledData) {
       console.log('📋 Returning stale cached scheduled data due to error');
       return res.json({
@@ -663,11 +752,11 @@ app.get('/api/scheduled', async (req, res) => {
   }
 });
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: Date.now(),
+    requestCount,
     cache: {
       live: {
         hasData: !!cachedLiveData,
@@ -683,22 +772,15 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoint to check if browser is working
 app.get('/debug/test', async (req, res) => {
   try {
     const page = await createPage();
     
-    // Visit main site first
-    await page.goto('https://api.sofascore.com/', {
-      waitUntil: 'domcontentloaded',
-      timeout: 15000
-    });
-    
-    await delay(2000);
+    await establishSession(page);
     
     const response = await page.goto('https://api.sofascore.com/api/v1/sport/football/events/live', {
       waitUntil: 'domcontentloaded',
-      timeout: 15000
+      timeout: 30000
     });
     
     const status = response.status();
@@ -709,14 +791,43 @@ app.get('/debug/test', async (req, res) => {
     res.json({
       status,
       contentPreview: content,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      requestCount
     });
   } catch (error) {
     res.status(500).json({
       error: error.message,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      requestCount
     });
   }
+});
+
+// Reset request count endpoint
+app.get('/debug/reset', (req, res) => {
+  requestCount = 0;
+  cachedLiveData = null;
+  cachedScheduledData = null;
+  lastLiveFetch = 0;
+  lastScheduledFetch = 0;
+  
+  res.json({
+    message: 'Reset successful',
+    timestamp: Date.now()
+  });
+});
+
+// Manual cache clear endpoint
+app.get('/debug/clear-cache', (req, res) => {
+  cachedLiveData = null;
+  cachedScheduledData = null;
+  lastLiveFetch = 0;
+  lastScheduledFetch = 0;
+  
+  res.json({
+    message: 'Cache cleared',
+    timestamp: Date.now()
+  });
 });
 
 // Graceful shutdown
@@ -738,7 +849,6 @@ async function gracefulShutdown(signal) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
   console.error('❌ Uncaught exception:', error);
   gracefulShutdown('UNCAUGHT_EXCEPTION');
@@ -752,9 +862,13 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running at http://0.0.0.0:${PORT}`);
   console.log(`📋 Cache duration: ${CACHE_DURATION / 1000}s`);
   console.log(`🔄 Concurrent limit: ${CONCURRENT_LIMIT}`);
+  console.log(`⏱️ Request delay: ${REQUEST_DELAY / 1000}s`);
   console.log(`🔧 Debug endpoints:`);
   console.log(`   - Test: http://localhost:${PORT}/debug/test`);
+  console.log(`   - Reset: http://localhost:${PORT}/debug/reset`);
+  console.log(`   - Clear Cache: http://localhost:${PORT}/debug/clear-cache`);
   console.log(`📊 API endpoints:`);
   console.log(`   - Live scores: http://localhost:${PORT}/api/livescores`);
   console.log(`   - Scheduled: http://localhost:${PORT}/api/scheduled`);
+  console.log(`   - Health: http://localhost:${PORT}/health`);
 });
