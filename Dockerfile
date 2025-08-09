@@ -1,64 +1,58 @@
-# Use Node.js 20 with better Puppeteer compatibility
-FROM node:20-alpine
+# Use Debian-based Node.js for stability (instead of Alpine)
+FROM node:20-slim
 
-# Install necessary dependencies for Puppeteer with better stability
-RUN apk add --no-cache \
+# Install Chromium + fonts & deps for Puppeteer
+RUN apt-get update && apt-get install -y \
     chromium \
-    nss \
-    freetype \
-    freetype-dev \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont \
-    ttf-dejavu \
-    ttf-droid \
-    ttf-liberation \
-    udev \
-    xvfb \
+    chromium-common \
+    chromium-driver \
+    fonts-liberation \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libgdk-pixbuf2.0-0 \
+    libnspr4 \
+    libnss3 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    xdg-utils \
     wget \
-    dumb-init \
-    && rm -rf /var/cache/apk/*
+    curl \
+    gnupg \
+ && rm -rf /var/lib/apt/lists/*
 
-# Configure Puppeteer environment variables for better stability
+# Puppeteer env vars (use system Chromium)
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
-    DISPLAY=:99 \
-    NODE_ENV=production \
-    CHROME_PATH=/usr/bin/chromium-browser \
-    CHROME_DEVEL_SANDBOX=/usr/lib/chromium/chrome_sandbox \
-    NODE_OPTIONS="--max-old-space-size=512"
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Create app directory with proper permissions
+# Create app directory
 WORKDIR /usr/src/app
 
-# Create a non-privileged user first
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nextjs -u 1001 -G nodejs
+# Copy package files first (cache layer)
+COPY package*.json ./
 
-# Copy package files and install dependencies with proper ownership
-COPY --chown=nextjs:nodejs package*.json ./
+# Install dependencies
+RUN npm install --only=production --verbose
 
-# Switch to non-privileged user before installing dependencies
-USER nextjs
+# Copy app files
+COPY server.js .
+COPY index.html .
 
-# Install app dependencies with verbose logging and timeout settings
-RUN npm ci --only=production --verbose --timeout=300000
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash nodeuser
+USER nodeuser
 
-# Copy application files with proper ownership
-COPY --chown=nextjs:nodejs server.js .
-COPY --chown=nextjs:nodejs index.html .
-
-# Create necessary directories with proper permissions
-RUN mkdir -p /tmp/chrome-user-data && \
-    chmod 755 /tmp/chrome-user-data
-
-# Expose port
+# Expose API port
 EXPOSE 3000
 
-# Health check with better configuration
-HEALTHCHECK --interval=60s --timeout=30s --start-period=120s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider --prefer-family=IPv4 --timeout=25 http://127.0.0.1:3000/health || exit 1
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
+    CMD curl -f http://127.0.0.1:3000/health || exit 1
 
-# Use dumb-init to handle signals properly and start the application
-ENTRYPOINT ["dumb-init", "--"]
-CMD ["node", "server.js"]
+# Start app
+CMD ["npm", "start"]
